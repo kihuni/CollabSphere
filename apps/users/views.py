@@ -1,73 +1,81 @@
-from rest_framework.views import APIView
+from rest_framework import status, generics
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
-from rest_framework import status
-from users.serializers import UserRegistrationSerializer
-from django.contrib.auth import authenticate
 from rest_framework_simplejwt.tokens import RefreshToken
-from users.services import AuthenticationService
-from django.core.exceptions import ValidationError
-from users.models import CustomUser
+from django.contrib.auth import authenticate
+from .serializers import (
+    UserSerializer, UserRegistrationSerializer,
+    UserLoginSerializer, UserProfileUpdateSerializer,
+)
 
+class RegisterView(generics.CreateAPIView):
+    """
+    API endpoint for user registration.
+    """
+    serializer_class = UserRegistrationSerializer
+    permission_classes = (AllowAny,)
 
-class UserRegistrationView(APIView):
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        
+        # Generate tokens
+        refresh = RefreshToken.for_user(user)
+        
+        return Response({
+            'user': UserSerializer(user).data,
+            'tokens': {
+                'refresh': str(refresh),
+                'access': str(refresh.access_token),
+            }
+        }, status=status.HTTP_201_CREATED)
+
+class LoginView(generics.GenericAPIView):
+    """
+    API endpoint for user login.
+    """
+    serializer_class = UserLoginSerializer
+    permission_classes = (AllowAny,)
+
     def post(self, request):
-        serializer = UserRegistrationSerializer(data=request.data)
-        if serializer.is_valid():
-            user = serializer.save()
-            return Response({
-                "message": "User registered successfully",
-                "email": user.email,
-                "username": user.username,
-                "full_name": user.full_name
-            }, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
-
-class LoginView(APIView):
-    def post(self, request):
-        email = request.data.get("email")
-        password = request.data.get("password")
-
-        user = authenticate(email=email, password=password)
-
-        if user:
-            # Check if account is locked
-            if user.is_account_locked():
-                return Response(
-                    {"error": "Account is locked. Try again later."},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-
-            # Validate login attempts
-            try:
-                AuthenticationService.validate_login_attempts(user)
-            except ValidationError as e:
-                return Response({"error": str(e)}, status=status.HTTP_403_FORBIDDEN)
-
-            # Generate JWT tokens
-            refresh = RefreshToken.for_user(user)
-            return Response({
-                "refresh": str(refresh),
-                "access": str(refresh.access_token),
-                "message": "Login successful"
-            }, status=status.HTTP_200_OK)
-
-        return Response(
-            {"error": "Invalid email or password"},
-            status=status.HTTP_401_UNAUTHORIZED
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        user = authenticate(
+            email=serializer.validated_data['email'],
+            password=serializer.validated_data['password']
         )
         
-class MFAVerificationView(APIView):
-    def post(self, request):
-        email = request.data.get("email")
-        mfa_token = request.data.get("mfa_token")
+        if user:
+            refresh = RefreshToken.for_user(user)
+            user.is_online = True
+            user.update_last_seen()
+            
+            return Response({
+                'user': UserSerializer(user).data,
+                'tokens': {
+                    'refresh': str(refresh),
+                    'access': str(refresh.access_token),
+                }
+            })
+            
+        return Response(
+            {'error': 'Invalid credentials'}, 
+            status=status.HTTP_401_UNAUTHORIZED
+        )
 
-        try:
-            user = CustomUser.objects.get(email=email)
-        except CustomUser.DoesNotExist:
-            return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+class ProfileView(generics.RetrieveUpdateAPIView):
+    """
+    API endpoint for retrieving and updating user profile.
+    """
+    serializer_class = UserProfileUpdateSerializer
+    permission_classes = (IsAuthenticated,)
 
-        if user.mfa_secret and AuthenticationService.verify_mfa_token(user.mfa_secret, mfa_token):
-            return Response({"message": "MFA verified successfully", "verified": True}, status=status.HTTP_200_OK)
-        return Response({"error": "Invalid MFA token", "verified": False}, status=status.HTTP_400_BAD_REQUEST)
+    def get_object(self):
+        return self.request.user
+
+    def get_serializer_class(self):
+        if self.request.method == 'GET':
+            return UserSerializer
+        return UserProfileUpdateSerializer
